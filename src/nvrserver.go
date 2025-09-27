@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -10,48 +11,86 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-func menuLoop() {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Println("\n=== NVR Menu ===")
-		fmt.Println("1. List cameras")
-		fmt.Println("2. Add camera")
-		fmt.Println("3. Edit camera")
-		fmt.Println("4. Remove camera")
-		fmt.Println("5. Show/Edit config")
-		fmt.Println("6. Start service")
-		fmt.Println("7. Stop service")
-		fmt.Println("8. Exit")
-		fmt.Print("Choose: ")
+type Worker struct {
+	cmd    *exec.Cmd
+	camera Camera
+	stopCh chan struct{}
+}
 
-		choiceStr, _ := reader.ReadString('\n')
-		choiceStr = strings.TrimSpace(choiceStr)
-		switch choiceStr {
-		case "1":
-			listCameras()
-		case "2":
-			addCamera(reader)
-		case "3":
-			editCamera(reader)
-		case "4":
-			removeCamera(reader)
-		case "5":
-			editConfig(reader)
-		case "6":
-			startService()
-		case "7":
-			stopService()
-		case "8":
-			fmt.Println("Exiting...")
-			return
-		default:
-			fmt.Println("Invalid choice.")
-		}
+var (
+	db        *sql.DB
+	workers   = make(map[int]*Worker)
+	workersMu sync.Mutex
+	config    Config
+)
+
+func main() {
+	initDB()
+	loadConfig()
+	// menuLoop()
+	go startCLIServer()
+}
+
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite", "./nvr.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Create tables if they don't exist
+	_, err = db.Exec(`
+	CREATE TABLE IF NOT EXISTS config (
+		id INTEGER PRIMARY KEY,
+		segment_time INTEGER NOT NULL,
+		retry_interval INTEGER NOT NULL,
+		max_backoff INTEGER NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS cameras (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		url TEXT NOT NULL UNIQUE,
+		output_dir TEXT NOT NULL UNIQUE,
+		restream_url TEXT UNIQUE,
+		username TEXT,
+		password TEXT
+	);
+	`)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func loadConfig() {
+	row := db.QueryRow("SELECT segment_time, retry_interval, max_backoff FROM config WHERE id=1")
+	err := row.Scan(&config.SegmentTime, &config.RetryInterval, &config.MaxBackoff)
+	if err == sql.ErrNoRows {
+		fmt.Println("No config found. Please set it up first.")
+		config = Config{SegmentTime: 300, RetryInterval: 10, MaxBackoff: 60}
+		saveConfig(config)
+	} else if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func saveConfig(cfg Config) {
+	_, err := db.Exec(`
+	INSERT INTO config (id, segment_time, retry_interval, max_backoff)
+	VALUES (1, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET 
+		segment_time=excluded.segment_time,
+		retry_interval=excluded.retry_interval,
+		max_backoff=excluded.max_backoff;
+	`, cfg.SegmentTime, cfg.RetryInterval, cfg.MaxBackoff)
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -82,6 +121,19 @@ func promptUniqueInput(reader *bufio.Reader, field, table, column string) string
 		}
 		return value
 	}
+}
+
+func checkIfValueExists(table, column, value string) int {
+	var count int
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s=?", table, column)
+	err := db.QueryRow(query, value).Scan(&count)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if count > 0 {
+		return 1
+	}
+	return 0
 }
 
 func promptYesNo(reader *bufio.Reader, question string) bool {
@@ -423,10 +475,10 @@ func addCameraFromCLI(fields []string) string {
 	return "Camera added successfully."
 }
 
-func listCamerasString() string {
-	rows, err := db.Query("SELECT id, name, url FROM cameras")
+func listCameras() ([]byte, error) {
+	rows, err := db.Query("SELECT * FROM cameras")
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -434,16 +486,12 @@ func listCamerasString() string {
 	for rows.Next() {
 		var cam Camera
 		if err := rows.Scan(&cam.ID, &cam.Name, &cam.URL); err != nil {
-			return fmt.Sprintf("Error: %v", err)
+			return nil, err
 		}
 		cameras = append(cameras, cam)
 	}
 
-	var sb strings.Builder
-	for _, cam := range cameras {
-		sb.WriteString(fmt.Sprintf("ID: %d, Name: %s, URL: %s\n", cam.ID, cam.Name, cam.URL))
-	}
-	return sb.String()
+	return json.Marshal(cameras)
 }
 
 func startCLIServer() {
