@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -47,7 +48,8 @@ var (
 func main() {
 	initDB()
 	loadConfig()
-	menuLoop()
+	// menuLoop()
+	go startCLIServer()
 }
 
 func initDB() {
@@ -478,5 +480,102 @@ func restartWorker(id int) {
 	err := row.Scan(&cam.ID, &cam.Name, &cam.URL, &cam.OutputDir, &cam.Restream)
 	if err == nil {
 		startWorker(cam)
+	}
+}
+
+func handleCLIConn(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		cmd := strings.TrimSpace(line)
+		response := handleCLICommand(cmd)
+		conn.Write([]byte(response + "\n"))
+	}
+}
+
+func handleCLICommand(cmd string) string {
+	parts := strings.SplitN(cmd, "|", 2)
+	switch parts[0] {
+	case "list":
+		return listCamerasString()
+	case "start":
+		startService()
+		return "Service started."
+	case "stop":
+		stopService()
+		return "Service stopped."
+	case "config":
+		return fmt.Sprintf("Current config: %+v", config)
+	case "add":
+		if len(parts) < 2 {
+			return "Usage: add|name|output_dir|rtsp_url|restream_url|username|password"
+		}
+		fields := strings.SplitN(parts[1], "|", 6)
+		if len(fields) < 6 {
+			return "Usage: add|name|output_dir|rtsp_url|restream_url|username|password"
+		}
+		return addCameraFromCLI(fields)
+	default:
+		return "Unknown command"
+	}
+}
+
+func addCameraFromCLI(fields []string) string {
+	name := fields[0]
+	outputDir := fields[1]
+	rtsp_url := fields[2]
+	restream := fields[3]
+	username := fields[4]
+	password := fields[5]
+
+	_, err := db.Exec(`
+        INSERT INTO cameras (name, url, output_dir, restream_url, username, password)
+        VALUES (?, ?, ?, ?, ?, ?)`,
+		name, rtsp_url, outputDir, sql.NullString{String: restream, Valid: restream != ""}, username, password)
+	if err != nil {
+		return fmt.Sprintf("Error adding camera: %v", err)
+	}
+	return "Camera added successfully."
+}
+
+func listCamerasString() string {
+	rows, err := db.Query("SELECT id, name, url FROM cameras")
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	defer rows.Close()
+
+	var cameras []Camera
+	for rows.Next() {
+		var cam Camera
+		if err := rows.Scan(&cam.ID, &cam.Name, &cam.URL); err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		cameras = append(cameras, cam)
+	}
+
+	var sb strings.Builder
+	for _, cam := range cameras {
+		sb.WriteString(fmt.Sprintf("ID: %d, Name: %s, URL: %s\n", cam.ID, cam.Name, cam.URL))
+	}
+	return sb.String()
+}
+
+func startCLIServer() {
+	ln, err := net.Listen("tcp", "127.0.0.1:9000")
+	if err != nil {
+		log.Fatalf("CLI server error: %v", err)
+	}
+	fmt.Println("CLI server listening on 127.0.0.1:9000")
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleCLIConn(conn)
 	}
 }
