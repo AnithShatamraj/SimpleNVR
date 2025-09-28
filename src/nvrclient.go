@@ -5,12 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -35,7 +33,7 @@ func menuLoop() {
 		case "1":
 			listCameras()
 		case "2":
-			addCamera(reader)
+			addCameraCLI(reader)
 		case "3":
 			editCamera(reader)
 		case "4":
@@ -76,7 +74,7 @@ func promptUniqueInput(reader *bufio.Reader, field, table, column string) string
 	for {
 		value := promptMandatoryInput(reader, field)
 		valueExists := checkIfValueExists(table, column, value)
-		if valueExists {
+		if valueExists == "true" {
 			fmt.Printf("'%s' already exists. Please enter a unique %s.\n", value, field)
 			continue
 		}
@@ -114,7 +112,7 @@ func getRTSPDetails(reader *bufio.Reader) (string, string, string) {
 			}
 
 			url_exists := checkIfValueExists("cameras", "url", url)
-			if url_exists {
+			if url_exists == "true" {
 				fmt.Printf("'%s' already exists. Please enter a unique RTSP URL.\n", url)
 				continue
 			}
@@ -153,7 +151,7 @@ func getRTSPDetails(reader *bufio.Reader) (string, string, string) {
 	return parsedURL, username, password
 }
 
-func addCamera(reader *bufio.Reader) {
+func addCameraCLI(reader *bufio.Reader) {
 	for {
 		var name, outputDir string
 		name = promptUniqueInput(reader, "Camera name: ", "cameras", "name")
@@ -224,7 +222,7 @@ func editCamera(reader *bufio.Reader) {
 	restartWorker(id)
 }
 
-func removeCamera(reader *bufio.Reader) {
+func removeCameraCLI(reader *bufio.Reader) {
 	listCameras()
 	fmt.Print("Enter camera ID to remove: ")
 	idStr, _ := reader.ReadString('\n')
@@ -263,166 +261,6 @@ func editConfig(reader *bufio.Reader) {
 	fmt.Println("Config updated.")
 }
 
-func startService() {
-	//Check if config is set
-
-	rows, err := db.Query("SELECT id, name, url, output_dir, username, password, restream_url FROM cameras")
-	if err != nil {
-		log.Fatal(err)
-		fmt.Println("Error starting service:\n", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var cam Camera
-		rows.Scan(&cam.ID, &cam.Name, &cam.URL, &cam.OutputDir, &cam.Username, &cam.Password, &cam.Restream)
-		startWorker(cam)
-	}
-	fmt.Println("Service started.")
-}
-
-func stopService() {
-	workersMu.Lock()
-	defer workersMu.Unlock()
-	for id := range workers {
-		stopWorker(id)
-	}
-	fmt.Println("Service stopped.")
-}
-
-func startWorker(cam Camera) {
-	workersMu.Lock()
-	defer workersMu.Unlock()
-
-	if _, exists := workers[cam.ID]; exists {
-		fmt.Printf("Worker for %s already running\n", cam.Name)
-		return
-	}
-
-	// Build ffmpeg command
-	fullURL := cam.URL
-	if cam.Username != "" {
-		parts := strings.SplitN(cam.URL, "://", 2)
-		fullURL = fmt.Sprintf("%s://%s:%s@%s", parts[0], cam.Username, cam.Password, parts[1])
-	}
-	args := []string{
-		"-i", fullURL,
-		"-c", "copy",
-		"-f", "segment",
-		"-segment_time", strconv.Itoa(config.SegmentTime),
-		fmt.Sprintf("%s/output_%%03d.mp4", cam.OutputDir),
-	}
-
-	if cam.Restream.Valid {
-		args = append(args, "-f", "rtsp", cam.Restream.String)
-	}
-
-	cmd := exec.Command("ffmpeg", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	stopCh := make(chan struct{})
-	workers[cam.ID] = &Worker{cmd: cmd, camera: cam, stopCh: stopCh}
-
-	go func() {
-		for {
-			err := cmd.Run()
-			if err != nil {
-				fmt.Printf("Worker for %s failed: %v. Retrying...\n", cam.Name, err)
-			}
-			select {
-			case <-stopCh:
-				return
-			default:
-				time.Sleep(time.Duration(config.RetryInterval) * time.Second)
-			}
-		}
-	}()
-}
-
-func stopWorker(id int) {
-	workersMu.Lock()
-	defer workersMu.Unlock()
-	if w, ok := workers[id]; ok {
-		close(w.stopCh)
-		if w.cmd.Process != nil {
-			w.cmd.Process.Kill()
-		}
-		delete(workers, id)
-		fmt.Printf("Stopped worker for camera %d\n", id)
-	}
-}
-
-func restartWorker(id int) {
-	stopWorker(id)
-
-	row := db.QueryRow("SELECT id, name, url, output_dir, restream_url FROM cameras WHERE id=?", id)
-	var cam Camera
-	err := row.Scan(&cam.ID, &cam.Name, &cam.URL, &cam.OutputDir, &cam.Restream)
-	if err == nil {
-		startWorker(cam)
-	}
-}
-
-func handleCLIConn(conn net.Conn) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return
-		}
-		cmd := strings.TrimSpace(line)
-		response := handleCLICommand(cmd)
-		conn.Write([]byte(response + "\n"))
-	}
-}
-
-func handleCLICommand(cmd string) string {
-	parts := strings.SplitN(cmd, "|", 2)
-	switch parts[0] {
-	case "list":
-		return listCamerasString()
-	case "start":
-		startService()
-		return "Service started."
-	case "stop":
-		stopService()
-		return "Service stopped."
-	case "config":
-		return fmt.Sprintf("Current config: %+v", config)
-	case "add":
-		if len(parts) < 2 {
-			return "Usage: add|name|output_dir|rtsp_url|restream_url|username|password"
-		}
-		fields := strings.SplitN(parts[1], "|", 6)
-		if len(fields) < 6 {
-			return "Usage: add|name|output_dir|rtsp_url|restream_url|username|password"
-		}
-		return addCameraFromCLI(fields)
-	default:
-		return "Unknown command"
-	}
-}
-
-func addCameraFromCLI(fields []string) string {
-	name := fields[0]
-	outputDir := fields[1]
-	rtsp_url := fields[2]
-	restream := fields[3]
-	username := fields[4]
-	password := fields[5]
-
-	_, err := db.Exec(`
-        INSERT INTO cameras (name, url, output_dir, restream_url, username, password)
-        VALUES (?, ?, ?, ?, ?, ?)`,
-		name, rtsp_url, outputDir, sql.NullString{String: restream, Valid: restream != ""}, username, password)
-	if err != nil {
-		return fmt.Sprintf("Error adding camera: %v", err)
-	}
-	return "Camera added successfully."
-}
-
 func listCamerasString() string {
 	rows, err := db.Query("SELECT id, name, url FROM cameras")
 	if err != nil {
@@ -444,19 +282,4 @@ func listCamerasString() string {
 		sb.WriteString(fmt.Sprintf("ID: %d, Name: %s, URL: %s\n", cam.ID, cam.Name, cam.URL))
 	}
 	return sb.String()
-}
-
-func startCLIServer() {
-	ln, err := net.Listen("tcp", "127.0.0.1:9000")
-	if err != nil {
-		log.Fatalf("CLI server error: %v", err)
-	}
-	fmt.Println("CLI server listening on 127.0.0.1:9000")
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			continue
-		}
-		go handleCLIConn(conn)
-	}
 }

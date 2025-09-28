@@ -94,36 +94,7 @@ func saveConfig(cfg Config) {
 	}
 }
 
-func promptInput(reader *bufio.Reader, field string) string {
-	fmt.Printf("Enter %s: ", field)
-	input, _ := reader.ReadString('\n')
-	return strings.TrimSpace(input)
-}
-
-func promptMandatoryInput(reader *bufio.Reader, field string) string {
-	for {
-		value := promptInput(reader, field)
-		if value == "" {
-			fmt.Printf("%s cannot be empty.\n", field)
-			continue
-		}
-		return value
-	}
-}
-
-func promptUniqueInput(reader *bufio.Reader, field, table, column string) string {
-	for {
-		value := promptMandatoryInput(reader, field)
-		valueExists := checkIfValueExists(table, column, value)
-		if valueExists {
-			fmt.Printf("'%s' already exists. Please enter a unique %s.\n", value, field)
-			continue
-		}
-		return value
-	}
-}
-
-func checkIfValueExists(table, column, value string) int {
+func checkIfValueExists(table, column, value string) string {
 	var count int
 	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s=?", table, column)
 	err := db.QueryRow(query, value).Scan(&count)
@@ -131,188 +102,9 @@ func checkIfValueExists(table, column, value string) int {
 		log.Fatal(err)
 	}
 	if count > 0 {
-		return 1
+		return "true"
 	}
-	return 0
-}
-
-func promptYesNo(reader *bufio.Reader, question string) bool {
-	for {
-		question = fmt.Sprintf("%s (y/n): ", question)
-		choice := promptMandatoryInput(reader, question)
-		switch choice {
-		case "y":
-			return true
-		case "n":
-			return false
-		}
-		fmt.Println("Invalid choice. Please enter 'y' or 'n'.")
-	}
-}
-
-func getRTSPDetails(reader *bufio.Reader) (string, string, string) {
-	var url, username, password, parsedURL, rtspFullURL string
-	for {
-		url = promptMandatoryInput(reader, "RTSP URL: ")
-		parsedURL := url
-		if strings.HasPrefix(url, "rtsp://") {
-			parts := strings.SplitN(url[7:], "@", 2)
-			if len(parts) == 2 && strings.Contains(parts[0], ":") {
-				up := strings.SplitN(parts[0], ":", 2)
-				username = up[0]
-				password = up[1]
-				parsedURL = "rtsp://" + parts[1]
-				fmt.Printf("Parsed URL: %s\nUsername: %s\nPassword: %s\n", parsedURL, username, password)
-			}
-
-			url_exists := checkIfValueExists("cameras", "url", url)
-			if url_exists {
-				fmt.Printf("'%s' already exists. Please enter a unique RTSP URL.\n", url)
-				continue
-			}
-
-		} else {
-			fmt.Println("Invalid RTSP URL. It should start with 'rtsp://'.")
-			continue
-		}
-		if username == "" {
-			username = promptInput(reader, "Username (optional): ")
-		}
-		if username != "" {
-			password = promptMandatoryInput(reader, "Password: ")
-		}
-		rtspFullURL = url
-		if username != "" {
-			rtspFullURL = fmt.Sprintf("rtsp://%s:%s@%s", username, password, strings.TrimPrefix(parsedURL, "rtsp://"))
-		}
-		fmt.Println("Checking if the stream is working...")
-		ffmpegArgs := []string{"-rtsp_transport", "tcp", "-i", rtspFullURL, "-t", "1", "-f", "null", "-"}
-		cmd := exec.Command("ffmpeg", ffmpegArgs...)
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-		err := cmd.Run()
-		if err != nil {
-			retryRTSP := promptYesNo(reader, "Error accessing the stream. Do you want to re-enter the URL?")
-			if retryRTSP {
-				continue
-			}
-		} else {
-			fmt.Println("Stream is reachable.")
-		}
-		break
-	}
-	// Parse RTSP URL for username and password
-	return parsedURL, username, password
-}
-
-func addCamera(reader *bufio.Reader) {
-	for {
-		var name, outputDir string
-		name = promptUniqueInput(reader, "Camera name: ", "cameras", "name")
-		outputDir = promptUniqueInput(reader, "Output directory: ", "cameras", "output_dir")
-
-		// Parse RTSP URL for username and password
-		rtsp_url, rtsp_username, rtsp_password := getRTSPDetails(reader)
-		// Sanity check: try to probe the stream with ffmpeg
-		restream := promptInput(reader, "Restream URL (optional): ")
-
-		_, err := db.Exec(`
-		INSERT INTO cameras (name, url, output_dir, restream_url, username, password)
-		VALUES (?, ?, ?, ?, ?, ?)
-		`, name, rtsp_url, outputDir, sql.NullString{String: restream, Valid: restream != ""}, rtsp_username, rtsp_password)
-		if err != nil {
-			log.Fatal(err)
-			retry := promptYesNo(reader, fmt.Sprintf("Error adding camera: \n%s.\n\nDo you want to retry?", err))
-			if !retry {
-				break
-			}
-		} else {
-			fmt.Println("Camera added successfully.")
-		}
-	}
-}
-
-func editCamera(reader *bufio.Reader) {
-	listCameras()
-	fmt.Print("Enter camera ID to edit: ")
-	idStr, _ := reader.ReadString('\n')
-	id, _ := strconv.Atoi(strings.TrimSpace(idStr))
-
-	fmt.Print("New name (blank to skip): ")
-	name, _ := reader.ReadString('\n')
-	fmt.Print("New URL (blank to skip): ")
-	url, _ := reader.ReadString('\n')
-	fmt.Print("New output dir (blank to skip): ")
-	outputDir, _ := reader.ReadString('\n')
-
-	updates := []string{}
-	args := []interface{}{}
-
-	if strings.TrimSpace(name) != "" {
-		updates = append(updates, "name=?")
-		args = append(args, strings.TrimSpace(name))
-	}
-	if strings.TrimSpace(url) != "" {
-		updates = append(updates, "url=?")
-		args = append(args, strings.TrimSpace(url))
-	}
-	if strings.TrimSpace(outputDir) != "" {
-		updates = append(updates, "output_dir=?")
-		args = append(args, strings.TrimSpace(outputDir))
-	}
-	if len(updates) == 0 {
-		fmt.Println("No changes.")
-		return
-	}
-	args = append(args, id)
-	query := "UPDATE cameras SET " + strings.Join(updates, ", ") + " WHERE id=?"
-	_, err := db.Exec(query, args...)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Camera updated.")
-
-	// If worker running, restart
-	restartWorker(id)
-}
-
-func removeCamera(reader *bufio.Reader) {
-	listCameras()
-	fmt.Print("Enter camera ID to remove: ")
-	idStr, _ := reader.ReadString('\n')
-	id, _ := strconv.Atoi(strings.TrimSpace(idStr))
-
-	stopWorker(id)
-	_, err := db.Exec("DELETE FROM cameras WHERE id=?", id)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Camera removed.")
-}
-
-func editConfig(reader *bufio.Reader) {
-	fmt.Printf("Current config: %+v\n", config)
-
-	fmt.Print("New segment time (sec, blank to skip): ")
-	segStr, _ := reader.ReadString('\n')
-	if strings.TrimSpace(segStr) != "" {
-		config.SegmentTime, _ = strconv.Atoi(strings.TrimSpace(segStr))
-	}
-
-	fmt.Print("New retry interval (sec, blank to skip): ")
-	retryStr, _ := reader.ReadString('\n')
-	if strings.TrimSpace(retryStr) != "" {
-		config.RetryInterval, _ = strconv.Atoi(strings.TrimSpace(retryStr))
-	}
-
-	fmt.Print("New max backoff (sec, blank to skip): ")
-	backStr, _ := reader.ReadString('\n')
-	if strings.TrimSpace(backStr) != "" {
-		config.MaxBackoff, _ = strconv.Atoi(strings.TrimSpace(backStr))
-	}
-
-	saveConfig(config)
-	fmt.Println("Config updated.")
+	return "false"
 }
 
 func startService() {
@@ -353,9 +145,9 @@ func startWorker(cam Camera) {
 
 	// Build ffmpeg command
 	fullURL := cam.URL
-	if cam.Username != "" {
+	if cam.Username.Valid && cam.Username.String != "" {
 		parts := strings.SplitN(cam.URL, "://", 2)
-		fullURL = fmt.Sprintf("%s://%s:%s@%s", parts[0], cam.Username, cam.Password, parts[1])
+		fullURL = fmt.Sprintf("%s://%s:%s@%s", parts[0], cam.Username.String, cam.Password.String, parts[1])
 	}
 	args := []string{
 		"-i", fullURL,
@@ -443,36 +235,47 @@ func handleCLICommand(cmd string) string {
 		return "Service stopped."
 	case "config":
 		return fmt.Sprintf("Current config: %+v", config)
-	case "add":
-		if len(parts) < 2 {
-			return "Usage: add|name|output_dir|rtsp_url|restream_url|username|password"
-		}
-		fields := strings.SplitN(parts[1], "|", 6)
-		if len(fields) < 6 {
-			return "Usage: add|name|output_dir|rtsp_url|restream_url|username|password"
-		}
-		return addCameraFromCLI(fields)
+	case "addCamera":
+		return addCamera(parts[1])
 	default:
 		return "Unknown command"
 	}
 }
 
-func addCameraFromCLI(fields []string) string {
-	name := fields[0]
-	outputDir := fields[1]
-	rtsp_url := fields[2]
-	restream := fields[3]
-	username := fields[4]
-	password := fields[5]
-
-	_, err := db.Exec(`
-        INSERT INTO cameras (name, url, output_dir, restream_url, username, password)
-        VALUES (?, ?, ?, ?, ?, ?)`,
-		name, rtsp_url, outputDir, sql.NullString{String: restream, Valid: restream != ""}, username, password)
+func addCamera(fields string) string {
+	var cam Camera
+	err := json.Unmarshal([]byte(fields), &cam)
 	if err != nil {
-		return fmt.Sprintf("Error adding camera: %v", err)
+		return fmt.Sprintf(`{"status": "failure", "message": "Invalid JSON: %v", "id": null}`, err)
 	}
-	return "Camera added successfully."
+
+	res, err := db.Exec(`
+		INSERT INTO cameras (name, url, output_dir, restream_url, username, password)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		cam.Name, cam.URL, cam.OutputDir, cam.Restream.String, cam.Username.String, cam.Password.String)
+	if err != nil {
+		return fmt.Sprintf(`{"status": "failure", "message": "Error adding camera: %v", "id": null}`, err)
+	}
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Sprintf(`{"status": "failure", "message": "Error getting inserted ID: %v", "id": null}`, err)
+	}
+
+	return fmt.Sprintf(`{"status": "success", "message": "Camera created successfully", "id": "%d"}`, id)
+}
+
+func removeCamera(id int) string {
+	workersMu.Lock()
+	defer workersMu.Unlock()
+	if _, ok := workers[id]; ok {
+		stopWorker(id)
+	}
+	_, err := db.Exec("DELETE FROM cameras WHERE id=?", id)
+	if err != nil {
+		return fmt.Sprintf(`{"status": "failure", "message": "Error removing camera: %v", "id": null}`, err)
+	}
+	return `{"status": "success", "message": "Camera removed successfully", "id": null}`
 }
 
 func listCameras() ([]byte, error) {
